@@ -67,7 +67,7 @@ function actualitzarFlashcard() {
   showingAnswer = false;
   const card = flashcardsData[currentCardIndex];
   cardBadge.textContent = card.errors
-    ? `🔥 ${card.errors} errors · ${card.seccio || 'Pregunta'} (Clica per girar)`
+    ? `✍️ ${card.errors} errors · ${card.seccio || 'Pregunta'} (Clica per girar)`
     : `Flashcard clau d'examen #${currentCardIndex + 1} (Clica per girar)`;
   cardText.textContent = card.pregunta;
   cardText.style.color = "#333";
@@ -105,6 +105,21 @@ let bancoPreguntes = [];
 let bancoPoliciaLocal = [];
 let bancoActualitat = [];
 
+// Petita utilitat global (fora de qualsevol closure) per escapar text quan
+// l'inserim com a HTML — la fem servir per mostrar l'ID de la pregunta de
+// forma segura des de qualsevol part del fitxer.
+function escapeHtmlGlobal(valor) {
+  return String(valor ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// Petita etiqueta amb l'ID de la pregunta, pensada per mostrar-se en petit
+// a un lateral de la pregunta durant els tests (perquè es pugui reportar
+// un error concret indicant l'ID al Gestor de preguntes).
+function etiquetaIdPreguntaHtml(preguntaObj) {
+  if (!preguntaObj || !preguntaObj.id) return '';
+  return `<span title="ID de la pregunta" style="font-size:10px;color:#94a3b8;font-weight:800;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:6px;padding:3px 8px;white-space:nowrap;flex:none;">🆔 ${escapeHtmlGlobal(preguntaObj.id)}</span>`;
+}
+
 function barrejarArray(array) {
     for (let i = array.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
@@ -125,7 +140,10 @@ function mostrarPregunta(preguntaObj) {
 
     contenedor.innerHTML = `
         <div class="pregunta-box" style="background: white; padding: 25px; border-radius: 16px; border: 1px solid #e2e8f0; margin-top: 15px;">
-            <h3 style="margin-top: 0; color: #0f172a; font-size: 16px;">${preguntaObj.pregunta}</h3>
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;">
+                <h3 style="margin: 0; color: #0f172a; font-size: 16px;">${preguntaObj.pregunta}</h3>
+                ${etiquetaIdPreguntaHtml(preguntaObj)}
+            </div>
             <div style="display: flex; flex-direction: column; gap: 10px; margin-top: 15px;" id="llista-opcions"></div>
         </div>
         <div id="feedback" style="margin-top: 15px;"></div>
@@ -146,9 +164,10 @@ function mostrarPregunta(preguntaObj) {
             const esCorrecte = (index === nouIndexCorrecte);
             
             if (preguntaObj.id) {
+                const fontPregunta = (typeof detectarFontPregunta === 'function' ? detectarFontPregunta(preguntaObj) : '') || 'Mossos';
                 registrarRespuestaGlobal(preguntaObj.id, esCorrecte, preguntaObj);
                 if (esCorrecte) {
-                    eliminarPreguntaAcertada(preguntaObj.id);
+                    eliminarPreguntaAcertada(preguntaObj.id, fontPregunta);
                 } else {
                     guardarPreguntaFallada(preguntaObj);
                 }
@@ -205,12 +224,24 @@ function registrarRespuestaGlobal(idPregunta, esCorrecta, preguntaObj = null) {
   // "descobertes" només marca que aquesta pregunta s'ha vist alguna vegada.
   // Per tant, repetir-la 2, 10 o 100 vegades NO augmenta el progrés.
   stats.descobertes[clau] = true;
-  stats.respondidas[idPregunta] = {
+
+  // Les respostes es guarden amb clau "Font::id" per evitar col·lisions quan
+  // dues preguntes de bancs diferents (Mossos / Policia Local / Actualitat)
+  // comparteixen el mateix identificador numèric.
+  stats.respondidas[clau] = {
     correcta: !!esCorrecta,
     font,
     ambit: preguntaObj?.ambit || '',
-    seccio: preguntaObj?.seccio || ''
+    seccio: preguntaObj?.seccio || '',
+    updatedAt: Date.now()
   };
+
+  // Compatibilitat amb dades antigues que encara consulten per id "nu":
+  // si ja no hi ha cap altra pregunta amb aquest mateix id en un altre banc,
+  // mantenim també l'entrada antiga sincronitzada.
+  if (stats.respondidas[idPregunta] && stats.respondidas[idPregunta].font === font) {
+    delete stats.respondidas[idPregunta];
+  }
 
   localStorage.setItem('mossos_stats_db', JSON.stringify(stats));
 
@@ -399,27 +430,41 @@ function obtenirEstadistiquesBanc(dataset) {
   const respostes = stats.respondidas || {};
   const descobertes = stats.descobertes || {};
   const total = dataset.length;
-  const ids = new Set(dataset.map(q => q.id).filter(Boolean));
-  const font = dataset.length ? (detectarFontPregunta(dataset[0]) || 'Mossos') : '';
   let contestades = 0;
   let encerts = 0;
 
-  ids.forEach(id => {
-    const clau = `${font}::${id}`;
-    const vista = Object.prototype.hasOwnProperty.call(descobertes, clau)
-      || Object.prototype.hasOwnProperty.call(respostes, id);
-    if (vista) {
-      contestades++;
-      if (normalitzarRespostaStat(respostes[id]).correcta === true) encerts++;
-    }
+  // Evitem comptar dues vegades el mateix id si, per error de dades,
+  // apareix repetit dins del mateix banc.
+  const idsUnics = new Set();
+
+  dataset.forEach(q => {
+    if (!q || !q.id) return;
+    if (idsUnics.has(q.id)) return;
+    idsUnics.add(q.id);
+
+    const font = detectarFontPregunta(q) || 'Mossos';
+    const clau = `${font}::${q.id}`;
+
+    // Registre de la resposta: primer mirem la clau namespaced (correcta),
+    // i si no existeix, mirem la clau antiga (bare id) per compatibilitat
+    // amb progrés guardat abans d'aquesta correcció.
+    const registre = respostes[clau] || respostes[q.id];
+
+    const vista = Object.prototype.hasOwnProperty.call(descobertes, clau) || !!registre;
+    if (!vista) return;
+
+    contestades++;
+    if (registre && normalitzarRespostaStat(registre).correcta === true) encerts++;
   });
 
   return {
     total,
     contestades,
     encerts,
-    errors: contestades - encerts,
-    progrés: total ? Math.round((contestades / total) * 100) : 0,
+    // El progrés real de l'oposició és el nombre de preguntes ÚNIQUES ja
+    // dominades (contestades i encertades) sobre el total del banc.
+    errors: Math.max(0, contestades - encerts),
+    progrés: total ? Math.round((encerts / total) * 100) : 0,
     pctErrors: contestades ? Math.round(((contestades - encerts) / contestades) * 100) : 0,
     pctEncerts: contestades ? Math.round((encerts / contestades) * 100) : 0
   };
@@ -461,7 +506,7 @@ function actualitzarDashboardInici() {
     const pct = el.querySelector('.dash-prog-pct');
     if (pct) pct.textContent = `${val.progrés}%`;
     const detail = el.querySelector('.dash-prog-detail');
-    if (detail) detail.textContent = `${val.contestades} / ${val.total} preguntes úniques`;
+    if (detail) detail.textContent = `${val.encerts} encertades de ${val.total} (${val.contestades} contestades)`;
     const err = el.querySelector('.dash-error');
     if (err) err.textContent = `${val.pctErrors}% errors · ${val.errors} fallades`;
   });
@@ -479,7 +524,7 @@ function actualitzarDashboardInici() {
           <div class="dash-rank-q">${q.pregunta}</div>
           <div class="dash-rank-meta">${q._font || detectarFontPregunta(q)} · ${q.seccio || q.ambit || 'Sense secció'}</div>
         </div>
-        <div class="dash-rank-count">🔥 ${q.errorCount || 1}</div>
+        <div class="dash-rank-count">🚨 ${q.errorCount || 1}</div>
       </div>
     `).join('') : `<div class="dash-empty">🎉 No tens errors acumulats. Això és exactament el que volem.</div>`;
   }
@@ -617,7 +662,10 @@ function iniciarRepasErrorsTots() {
           <button id="rep-errors-exit" style="background:#e2e8f0;color:#334155;border:0;border-radius:8px;padding:10px 14px;font-weight:800;cursor:pointer;">🏠 Inici</button>
         </div>
         <div style="background:white;border:1px solid #e2e8f0;border-radius:16px;padding:25px;">
-          <div style="font-size:12px;color:#64748b;font-weight:800;margin-bottom:9px;">Pregunta ${index+1} de ${errors.length}</div>
+          <div style="font-size:12px;color:#64748b;font-weight:800;margin-bottom:9px;display:flex;justify-content:space-between;align-items:center;gap:10px;">
+            <span>Pregunta ${index+1} de ${errors.length}</span>
+            ${etiquetaIdPreguntaHtml(q)}
+          </div>
           <h3 style="margin:0 0 20px;color:#0f172a;font-size:18px;line-height:1.45;">${escapeHtmlRep(q.pregunta || '')}</h3>
           <div id="rep-errors-options" style="display:flex;flex-direction:column;gap:10px;"></div>
           <div id="rep-errors-feedback"></div>
@@ -775,6 +823,8 @@ document.addEventListener('DOMContentLoaded', () => {
         mostrarTemarioPL();
       } else if (targetTab === 'actualitat') {
         mostrarTemarioActualitat();
+      } else if (targetTab === 'editor') {
+        mostrarGestorPreguntes();
       }
     });
   });
@@ -789,16 +839,35 @@ document.addEventListener('DOMContentLoaded', () => {
       bancoPreguntes = bancoPreguntes.flat();
     }
 
-    console.log("S'han carregat correctament", bancoPreguntes.length, "preguntes de Mossos.");
+    // Afegim les preguntes creades/editades des del Gestor de preguntes
+    // (es guarden a localStorage perquè encara no hi ha base de dades al servidor).
+    const _custom = carregarPreguntesCustom();
+    bancoPreguntes = bancoPreguntes.concat(_custom.mossos || []);
+    bancoPoliciaLocal = bancoPoliciaLocal.concat(_custom.pl || []);
+    bancoActualitat = bancoActualitat.concat(_custom.act || []);
 
-    if (typeof mostrarTemarioMossos === 'function') mostrarTemarioMossos();
-    if (typeof mostrarInici === 'function') mostrarInici();
-    actualitzarBotonsRepasErrors();
-    actualizarEstadisticasTop();
+    // Apliquem les correccions fetes des del Gestor de preguntes a preguntes
+    // del banc ORIGINAL (cercades i editades per ID). Es guarden a part
+    // (overrides) perquè el fitxer .js original és de només lectura des
+    // del navegador; així el canvi es veu igualment de seguida a tota l'app.
+    const _overrides = carregarOverridesPreguntes();
+    bancoPreguntes = aplicarOverridesBanc(bancoPreguntes, _overrides.mossos);
+    bancoPoliciaLocal = aplicarOverridesBanc(bancoPoliciaLocal, _overrides.pl);
+    bancoActualitat = aplicarOverridesBanc(bancoActualitat, _overrides.act);
+
+    console.log("S'han carregat correctament", bancoPreguntes.length, "preguntes de Mossos.");
 
   } catch (error) {
     console.error("Error en la càrrega dels bancs:", error);
   }
+
+  // Cada funció d'inicialització es crida en el seu propi try/catch: si una falla,
+  // les altres (incloent mostrarInici, que pinta les Convocatòries Actives guardades)
+  // continuen executant-se igualment.
+  try { if (typeof mostrarTemarioMossos === 'function') mostrarTemarioMossos(); } catch (e) { console.error('Error a mostrarTemarioMossos:', e); }
+  try { if (typeof mostrarInici === 'function') mostrarInici(); } catch (e) { console.error('Error a mostrarInici:', e); }
+  try { actualitzarBotonsRepasErrors(); } catch (e) { console.error('Error a actualitzarBotonsRepasErrors:', e); }
+  try { actualizarEstadisticasTop(); } catch (e) { console.error('Error a actualizarEstadisticasTop:', e); }
 
   // --- CONVOCATÒRIES GESTIONABLES DES DE LA INTERFÍCIE ---
   const CONVOCATORIES_KEY = 'agentmedina_convocatories_v2';
@@ -1010,6 +1079,22 @@ document.addEventListener('DOMContentLoaded', () => {
           </div>
         </div>
 
+        <div style="background:#ffffff;border:1.5px solid #e2e8f0;padding:18px;border-radius:12px;">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+            <span style="font-size:18px;">💾</span>
+            <h4 style="margin:0;font-size:15px;color:#002B5E;">Còpia de seguretat del progrés (PC ⇄ Android)</h4>
+          </div>
+          <p style="margin:0 0 12px;font-size:12.5px;color:#64748b;line-height:1.5;">
+            Descarrega el teu progrés (errors, ratxa, estadístiques, convocatòries) des de l'ordinador i importa'l al mòbil Android —o a l'inrevés— per tenir-ho tot sincronitzat sense servidors externs.
+          </p>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;">
+            <button id="btn-exportar-progres" type="button" style="flex:1;min-width:170px;background:#002B5E;color:#E8C000;border:none;border-radius:8px;padding:12px 16px;font-weight:800;font-size:13.5px;cursor:pointer;">⬇️ Exportar progrés (JSON)</button>
+            <label for="input-importar-progres" style="flex:1;min-width:170px;text-align:center;background:#fff;color:#002B5E;border:1.5px solid #002B5E;border-radius:8px;padding:12px 16px;font-weight:800;font-size:13.5px;cursor:pointer;">⬆️ Importar progrés (JSON)</label>
+            <input id="input-importar-progres" type="file" accept="application/json,.json" style="display:none;">
+            <button id="btn-instalar-app" type="button" style="display:none;flex:1;min-width:170px;background:#16a34a;color:#fff;border:none;border-radius:8px;padding:12px 16px;font-weight:800;font-size:13.5px;cursor:pointer;">📲 Instal·lar l'app al dispositiu</button>
+          </div>
+        </div>
+
         <div>
           <div style="display:flex;align-items:end;justify-content:space-between;gap:10px;margin-bottom:10px;">
             <div>
@@ -1042,11 +1127,11 @@ document.addEventListener('DOMContentLoaded', () => {
           </div>
         </div>
 
-        <div style="display:grid;grid-template-columns:minmax(0,1.35fr) minmax(300px,.65fr);gap:16px;">
-          <div style="background:white;border:1px solid #e9ecef;padding:20px;border-radius:12px;">
+        <div class="dash-fallades-flash">
+          <div class="fallades-block" style="background:white;border:1px solid #e9ecef;padding:20px;border-radius:12px;">
             <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px;">
               <div>
-                <h3 style="margin:0;font-size:18px;">🔥 Preguntes més fallades</h3>
+                <h3 style="margin:0;font-size:18px;">✍️ Preguntes més fallades</h3>
                 <p style="margin:4px 0 0;color:#64748b;font-size:12px;">La classificació suma cada vegada que tornes a fallar una pregunta.</p>
               </div>
               <button onclick="actualitzarFlashcardsDesErrors();actualitzarFlashcard()" style="background:#eef6ff;color:#0057a8;border:1px solid #bfdbfe;padding:7px 10px;border-radius:8px;font-weight:800;cursor:pointer;">⚡ Flashcards</button>
@@ -1054,7 +1139,7 @@ document.addEventListener('DOMContentLoaded', () => {
             <div id="ranking-errors"></div>
           </div>
 
-          <div style="background:white;border:1px solid #e9ecef;padding:20px;border-radius:12px;">
+          <div class="flashcard-block" style="background:white;border:1px solid #e9ecef;padding:20px;border-radius:12px;">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
               <h3 style="margin:0;font-size:18px;">⚡ Flashcards</h3>
               <span id="flashcard-meta" style="font-size:11px;color:#94a3b8;"></span>
@@ -1093,6 +1178,17 @@ document.addEventListener('DOMContentLoaded', () => {
       document.querySelector('[data-tab="mossos"]')?.click();
       setTimeout(() => document.querySelector('.tab-interna[data-subtab="examen"]')?.click(), 0);
     });
+
+    const btnExportar = document.getElementById('btn-exportar-progres');
+    if (btnExportar) btnExportar.addEventListener('click', exportarProgresJSON);
+    const inputImportar = document.getElementById('input-importar-progres');
+    if (inputImportar) inputImportar.addEventListener('change', () => gestionarSeleccioFitxerImport(inputImportar));
+    const btnInstalarApp = document.getElementById('btn-instalar-app');
+    if (btnInstalarApp) {
+      btnInstalarApp.addEventListener('click', instalarAppPWA);
+      if (window.deferredInstallPromptDisponible) btnInstalarApp.style.display = 'inline-flex';
+    }
+
     pintarConvocatories();
 
     actualitzarFlashcardsDesErrors();
@@ -1224,6 +1320,20 @@ document.addEventListener('DOMContentLoaded', () => {
       });
     });
 
+    // Omplir el percentatge real de progrés de cada Àmbit (A/B/C), calculat a partir
+    // de les preguntes úniques ja contestades de cada àmbit. Abans es quedava fix a "0%".
+    ambitsMossos.forEach(ambit => {
+      const nomAmbit = ambit.querySelector('.amb-name')?.innerText.trim() || "";
+      const pctEl = ambit.querySelector('.amb-pct');
+      if (!pctEl) return;
+      let subset = [];
+      if (nomAmbit.includes("Àmbit A")) subset = bancoPreguntes.filter(q => q.ambit === 'Àmbit A');
+      else if (nomAmbit.includes("Àmbit B")) subset = bancoPreguntes.filter(q => q.ambit === 'Àmbit B');
+      else if (nomAmbit.includes("Àmbit C")) subset = bancoPreguntes.filter(q => q.ambit === 'Àmbit C');
+      const est = obtenirEstadistiquesBanc(subset);
+      pctEl.textContent = `${est.progrés}%`;
+    });
+
     actualitzarBotonsRepasErrors();
   }
 
@@ -1259,16 +1369,23 @@ document.addEventListener('DOMContentLoaded', () => {
               <span class="amb-chev">▸</span>
             </button>
             <div class="pl-municipis-list" style="display:none;padding:8px 12px 4px 42px;">
-              <button class="pl-municipi" data-municipi="Tàrrega">Tàrrega</button>
-              <button class="pl-municipi" data-municipi="Cunit">Cunit</button>
-              <button class="pl-municipi" data-municipi="Cubelles">Cubelles</button>
+              ${carregarMunicipisPL().map(m => `
+                <div style="display:flex;align-items:center;gap:6px;margin:5px 0;">
+                  <button class="pl-municipi" data-municipi="${escapeHtml(m)}" style="flex:1;">${escapeHtml(m)}</button>
+                  <button class="pl-municipi-eliminar" data-municipi="${escapeHtml(m)}" title="Eliminar municipi" style="flex:none;border:none;background:#fee2e2;color:#b91c1c;border-radius:8px;width:32px;height:32px;font-weight:800;cursor:pointer;">🗑</button>
+                </div>
+              `).join('')}
+              <div style="display:flex;gap:6px;margin:8px 0 4px;">
+                <input id="pl-nou-municipi" type="text" placeholder="Nom del municipi..." style="flex:1;min-width:0;font-size:16px;padding:8px 10px;border:1.5px solid #E2E8F0;border-radius:8px;">
+                <button id="pl-afegir-municipi" style="flex:none;background:var(--gold2,#E8C000);color:var(--blue,#002B5E);border:none;border-radius:8px;padding:0 14px;font-weight:800;cursor:pointer;">➕</button>
+              </div>
             </div>
           </div>
 
           <div class="hub-ambit2 amb-active">
-            <button class="amb-bar amb-bar-pl" data-pl-section="actualitat">
+            <button class="amb-bar amb-bar-pl" data-pl-section="cultura general">
               <span class="amb-sq" style="background:#16a34a;"></span>
-              <span class="amb-name">Actualitat</span>
+              <span class="amb-name">Cultura general</span>
               <span class="amb-chev">▸</span>
             </button>
           </div>
@@ -1288,7 +1405,7 @@ document.addEventListener('DOMContentLoaded', () => {
           if (list) list.style.display = list.style.display === 'none' ? 'block' : 'none';
           return;
         }
-        const nom = section === 'teoria' ? 'Teoria' : 'Actualitat';
+        const nom = section === 'teoria' ? 'Teoria' : 'Cultura general';
         const filtrades = bancoPoliciaLocal.filter(q => {
           const txt = `${q.seccio || ''} ${q.ambit || ''} ${q.tema || ''}`.toLowerCase();
           return txt.includes(section);
@@ -1297,12 +1414,14 @@ document.addEventListener('DOMContentLoaded', () => {
           alert(`Encara no hi ha preguntes carregades per a «${nom}». Aquest apartat està preparat per afegir contingut.`);
           return;
         }
-        mostrarSelectorPreguntas(nom, filtrades, false);
+        // Igual que a Mossos: mostrem el selector de seccions perquè es puguin
+        // triar una, vàries o totes les seccions abans de començar el test.
+        mostrarSelectorSeccions(nom, filtrades, mostrarTemarioPL);
       });
     });
 
     contenedor.querySelectorAll('.pl-municipi').forEach(btn => {
-      btn.style.cssText = 'display:block;width:100%;margin:5px 0;padding:9px 12px;text-align:left;border:1px solid #e2e8f0;background:#fff;border-radius:8px;cursor:pointer;font-weight:700;color:#334155;';
+      btn.style.cssText = 'display:block;width:100%;margin:0;padding:9px 12px;text-align:left;border:1px solid #e2e8f0;background:#fff;border-radius:8px;cursor:pointer;font-weight:700;color:#334155;';
       btn.addEventListener('click', () => {
         const municipi = btn.dataset.municipi;
         const filtrades = bancoPoliciaLocal.filter(q => {
@@ -1313,9 +1432,39 @@ document.addEventListener('DOMContentLoaded', () => {
           alert(`Encara no hi ha preguntes carregades per a ${municipi}. Aquest apartat està preparat per afegir contingut.`);
           return;
         }
-        mostrarSelectorPreguntas(municipi, filtrades, false);
+        // Igual que a Teoria/Cultura general: agrupem per "seccio" dins del
+        // municipi (p. ex. Municipi > Cunit > Ordenança de convivència),
+        // en lloc d'anar directes al test amb totes les preguntes barrejades.
+        mostrarSelectorSeccions(municipi, filtrades, mostrarTemarioPL);
       });
     });
+
+    contenedor.querySelectorAll('.pl-municipi-eliminar').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const municipi = btn.dataset.municipi;
+        if (!confirm(`Eliminar «${municipi}» de la llista de municipis?\n\n(Les preguntes que ja tinguis guardades amb aquest municipi no s'esborren, només deixa de sortir a la llista.)`)) return;
+        eliminarMunicipiPL(municipi);
+        mostrarTemarioPL();
+        const list = document.querySelector('.pl-municipis-list');
+        if (list) list.style.display = 'block';
+      });
+    });
+
+    const btnAfegirMunicipi = document.getElementById('pl-afegir-municipi');
+    const inputNouMunicipi = document.getElementById('pl-nou-municipi');
+    if (btnAfegirMunicipi && inputNouMunicipi) {
+      const afegir = () => {
+        const nom = inputNouMunicipi.value.trim();
+        if (!nom) return;
+        afegirMunicipiPL(nom);
+        mostrarTemarioPL();
+        const list = document.querySelector('.pl-municipis-list');
+        if (list) list.style.display = 'block';
+      };
+      btnAfegirMunicipi.addEventListener('click', afegir);
+      inputNouMunicipi.addEventListener('keydown', (e) => { if (e.key === 'Enter') afegir(); });
+    }
 
     actualitzarBotonsRepasErrors();
     actualitzarRatxaUI();
@@ -1413,12 +1562,528 @@ document.addEventListener('DOMContentLoaded', () => {
           alert(`Encara no hi ha preguntes carregades per a «${categoria}». Aquest apartat està preparat per afegir contingut.`);
           return;
         }
-        mostrarSelectorPreguntas(categoria, filtrades, true);
+        // Igual que a Mossos i Policia Local: selector de seccions per triar
+        // una, vàries o totes les seccions dins d'aquesta categoria.
+        mostrarSelectorSeccions(categoria, filtrades, mostrarTemarioActualitat);
       });
     });
 
     actualitzarBotonsRepasErrors();
   }
+
+  // --- MUNICIPIS DE POLICIA LOCAL (afegir/eliminar des de la interfície) ---
+  const MUNICIPIS_PL_KEY = 'agentmedina_municipis_pl_v1';
+  const MUNICIPIS_PL_DEFECTE = ['Tàrrega', 'Cunit', 'Cubelles'];
+
+  function carregarMunicipisPL() {
+    try {
+      const raw = localStorage.getItem(MUNICIPIS_PL_KEY);
+      const llista = raw ? JSON.parse(raw) : null;
+      return Array.isArray(llista) ? llista : [...MUNICIPIS_PL_DEFECTE];
+    } catch (e) {
+      console.error('Error llegint municipis PL:', e);
+      return [...MUNICIPIS_PL_DEFECTE];
+    }
+  }
+  window.carregarMunicipisPL = carregarMunicipisPL;
+
+  function guardarMunicipisPL(llista) {
+    localStorage.setItem(MUNICIPIS_PL_KEY, JSON.stringify(llista));
+  }
+
+  function afegirMunicipiPL(nom) {
+    const llista = carregarMunicipisPL();
+    const net = String(nom || '').trim();
+    if (!net) return;
+    if (llista.some(m => m.toLowerCase() === net.toLowerCase())) return;
+    llista.push(net);
+    guardarMunicipisPL(llista);
+  }
+
+  function eliminarMunicipiPL(nom) {
+    const llista = carregarMunicipisPL().filter(m => m !== nom);
+    guardarMunicipisPL(llista);
+  }
+
+  // --- GESTOR DE PREGUNTES (afegir / editar, individual i massiu) ---
+  // Com que l'app encara és estàtica (sense servidor/base de dades), les
+  // preguntes que es creen o editen aquí es guarden a localStorage i es
+  // fusionen amb els bancs originals en carregar l'app (veure més amunt,
+  // a "CARGA DE BANCOS DE DATOS"). Per fer-les permanents de debò cal
+  // exportar-les (botó "Exportar JSON") i enganxar-les al fitxer .js
+  // corresponent (Mossos_Preguntas.js / P.L.Preguntas.js / Actualidad_preguntas.js).
+  const CUSTOM_PREGUNTES_KEY = 'agentmedina_preguntes_custom_v1';
+
+  // --- CORRECCIONS (OVERRIDES) A PREGUNTES DEL BANC ORIGINAL ---
+  // Quan s'edita, des del Gestor, una pregunta que NO és personalitzada
+  // (és a dir, que ve d'un dels fitxers .js originals), no la podem
+  // modificar directament (és de només lectura al navegador). En comptes
+  // d'això guardem només els canvis fets, indexats per ID, i els apliquem
+  // per sobre de la pregunta original cada cop que es carrega l'app.
+  const OVERRIDES_PREGUNTES_KEY = 'agentmedina_overrides_preguntes_v1';
+
+  function carregarOverridesPreguntes() {
+    try {
+      const raw = localStorage.getItem(OVERRIDES_PREGUNTES_KEY);
+      const dades = raw ? JSON.parse(raw) : {};
+      return {
+        mossos: (dades.mossos && typeof dades.mossos === 'object') ? dades.mossos : {},
+        pl: (dades.pl && typeof dades.pl === 'object') ? dades.pl : {},
+        act: (dades.act && typeof dades.act === 'object') ? dades.act : {}
+      };
+    } catch (e) {
+      console.error('Error llegint correccions de preguntes:', e);
+      return { mossos: {}, pl: {}, act: {} };
+    }
+  }
+  window.carregarOverridesPreguntes = carregarOverridesPreguntes;
+
+  function guardarOverridesPreguntes(dades) {
+    localStorage.setItem(OVERRIDES_PREGUNTES_KEY, JSON.stringify(dades));
+  }
+
+  function aplicarOverridesBanc(llista, overridesBanc) {
+    if (!Array.isArray(llista) || !overridesBanc) return llista;
+    return llista.map(q => (q && q.id && overridesBanc[q.id]) ? { ...q, ...overridesBanc[q.id] } : q);
+  }
+
+  function desarOverridePregunta(banc, preguntaNormalitzada) {
+    const dades = carregarOverridesPreguntes();
+    dades[banc][preguntaNormalitzada.id] = preguntaNormalitzada;
+    guardarOverridesPreguntes(dades);
+  }
+
+  function eliminarOverridePregunta(banc, id) {
+    const dades = carregarOverridesPreguntes();
+    if (dades[banc] && dades[banc][id]) {
+      delete dades[banc][id];
+      guardarOverridesPreguntes(dades);
+    }
+  }
+
+  // Retorna l'array (viu, en memòria) del banc de preguntes actiu.
+  function obtenirBancActiu(banc) {
+    if (banc === 'pl') return bancoPoliciaLocal;
+    if (banc === 'act') return bancoActualitat;
+    return bancoPreguntes;
+  }
+
+  function carregarPreguntesCustom() {
+    try {
+      const raw = localStorage.getItem(CUSTOM_PREGUNTES_KEY);
+      const dades = raw ? JSON.parse(raw) : {};
+      return {
+        mossos: Array.isArray(dades.mossos) ? dades.mossos : [],
+        pl: Array.isArray(dades.pl) ? dades.pl : [],
+        act: Array.isArray(dades.act) ? dades.act : []
+      };
+    } catch (e) {
+      console.error('Error llegint preguntes personalitzades:', e);
+      return { mossos: [], pl: [], act: [] };
+    }
+  }
+  window.carregarPreguntesCustom = carregarPreguntesCustom;
+
+  function guardarPreguntesCustom(dades) {
+    localStorage.setItem(CUSTOM_PREGUNTES_KEY, JSON.stringify(dades));
+  }
+
+  function generarIdCustom(prefix) {
+    return `${prefix}_CUSTOM_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+  }
+
+  // Valida i normalitza una pregunta arribada del formulari o d'un import massiu.
+  function normalitzarPreguntaEditor(q, banc) {
+    if (!q || typeof q !== 'object') throw new Error('Pregunta no vàlida.');
+    const pregunta = String(q.pregunta || '').trim();
+    const opcions = Array.isArray(q.opcions) ? q.opcions.map(o => String(o || '').trim()) : [];
+    if (!pregunta) throw new Error('Falta el text de la pregunta.');
+    if (opcions.length < 2 || opcions.some(o => !o)) throw new Error(`Cal almenys 2 opcions (pregunta: "${pregunta.slice(0, 40)}...").`);
+    let resposta = q.resposta;
+    if (typeof resposta === 'string' && /^\d+$/.test(resposta.trim())) resposta = parseInt(resposta, 10);
+    if (typeof resposta !== 'number' || resposta < 0 || resposta >= opcions.length) {
+      throw new Error(`La resposta correcta no és vàlida (pregunta: "${pregunta.slice(0, 40)}...").`);
+    }
+    const base = {
+      id: q.id || generarIdCustom(banc === 'mossos' ? 'MOSSOS' : banc === 'pl' ? 'PL' : 'ACT'),
+      pregunta,
+      opcions,
+      resposta,
+      explicacio: String(q.explicacio || '').trim()
+    };
+    if (banc === 'mossos') {
+      base.ambit = q.ambit || 'Àmbit A';
+      base.seccio = String(q.seccio || '').trim();
+    } else if (banc === 'pl') {
+      base.seccio = String(q.seccio || '').trim();
+      base.tema = String(q.tema || '').trim();
+      if (q.municipi) base.municipi = String(q.municipi).trim();
+    } else if (banc === 'act') {
+      base.categoria = q.categoria || 'Altres';
+      base.seccio = String(q.seccio || '').trim();
+    }
+    return base;
+  }
+
+  function afegirPreguntesCustom(banc, preguntes) {
+    const dades = carregarPreguntesCustom();
+    const normalitzades = preguntes.map(q => normalitzarPreguntaEditor(q, banc));
+    dades[banc] = [...dades[banc], ...normalitzades];
+    guardarPreguntesCustom(dades);
+    // Afegim també les preguntes noves a l'array VIU en memòria (bancoPreguntes /
+    // bancoPoliciaLocal / bancoActualitat) perquè apareguin de seguida als tests,
+    // sense haver de recarregar la pàgina.
+    const arrayViu = obtenirBancActiu(banc);
+    if (Array.isArray(arrayViu)) arrayViu.push(...normalitzades);
+    return normalitzades.length;
+  }
+
+  function eliminarPreguntaCustom(banc, id) {
+    const dades = carregarPreguntesCustom();
+    dades[banc] = dades[banc].filter(q => q.id !== id);
+    guardarPreguntesCustom(dades);
+  }
+  window.eliminarPreguntaCustom = function (banc, id) {
+    if (!confirm('Eliminar aquesta pregunta?')) return;
+    eliminarPreguntaCustom(banc, id);
+    mostrarGestorPreguntes();
+  };
+
+  // Desa els canvis fets a una pregunta EXISTENT (identificada per ID).
+  // Si l'ID pertany a una pregunta personalitzada, actualitza aquell
+  // registre; si pertany al banc original, es desa com a "override".
+  // També actualitza la còpia en memòria perquè el canvi es vegi a l'instant.
+  function desarPreguntaEditada(banc, id, dadesFormulari) {
+    const normalitzada = normalitzarPreguntaEditor({ ...dadesFormulari, id }, banc);
+    const custom = carregarPreguntesCustom();
+    const idxCustom = (custom[banc] || []).findIndex(q => q.id === id);
+    if (idxCustom !== -1) {
+      custom[banc][idxCustom] = normalitzada;
+      guardarPreguntesCustom(custom);
+    } else {
+      desarOverridePregunta(banc, normalitzada);
+    }
+    const arrayViu = obtenirBancActiu(banc);
+    const idxViu = arrayViu.findIndex(q => q && q.id === id);
+    if (idxViu !== -1) arrayViu[idxViu] = { ...arrayViu[idxViu], ...normalitzada };
+    return normalitzada;
+  }
+
+  // Omple el formulari d'"Afegir / editar pregunta" amb les dades d'una
+  // pregunta existent i el deixa en "mode edició".
+  function carregarPreguntaAFormulari(banc, q) {
+    if (!q) return;
+    const btnGuardar = document.getElementById('ed-guardar-una');
+    if (btnGuardar) {
+      btnGuardar.dataset.editId = q.id;
+      btnGuardar.textContent = '💾 Guardar canvis';
+    }
+    const btnCancelar = document.getElementById('ed-cancelar-edicio');
+    if (btnCancelar) btnCancelar.style.display = 'inline-block';
+    const avis = document.getElementById('ed-avis-edicio');
+    if (avis) {
+      avis.style.display = 'inline-block';
+      avis.textContent = `✏️ Editant: ${q.id}`;
+    }
+
+    const camp = (elId) => document.getElementById(elId);
+    if (camp('ed-pregunta')) camp('ed-pregunta').value = q.pregunta || '';
+    [0, 1, 2, 3].forEach(i => { if (camp(`ed-op${i}`)) camp(`ed-op${i}`).value = (q.opcions && q.opcions[i]) || ''; });
+    if (camp('ed-resposta')) camp('ed-resposta').value = String(q.resposta ?? 0);
+    if (camp('ed-explicacio')) camp('ed-explicacio').value = q.explicacio || '';
+    if (banc === 'mossos') {
+      if (camp('ed-ambit')) camp('ed-ambit').value = q.ambit || 'Àmbit A';
+      if (camp('ed-seccio')) camp('ed-seccio').value = q.seccio || '';
+    } else if (banc === 'pl') {
+      if (camp('ed-tema')) camp('ed-tema').value = q.tema || '';
+      if (camp('ed-seccio')) camp('ed-seccio').value = q.seccio || '';
+      if (camp('ed-municipi')) camp('ed-municipi').value = q.municipi || '';
+    } else {
+      if (camp('ed-categoria')) camp('ed-categoria').value = q.categoria || 'Altres';
+      if (camp('ed-seccio')) camp('ed-seccio').value = q.seccio || '';
+    }
+    camp('ed-pregunta')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+
+  // Permet obrir directament l'edició d'una pregunta (per ID) des de
+  // qualsevol botó de la pàgina (p. ex. la llista de preguntes noves).
+  window.editarPreguntaPerId = function (banc, id) {
+    mostrarGestorPreguntes(banc);
+    const dataset = obtenirBancActiu(banc);
+    const trobada = dataset.find(q => q && String(q.id) === String(id));
+    if (trobada) carregarPreguntaAFormulari(banc, trobada);
+  };
+
+  function exportarPreguntesCustom(banc) {
+    const dades = carregarPreguntesCustom();
+    const llista = dades[banc] || [];
+    const blob = new Blob([JSON.stringify(llista, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const noms = { mossos: 'mossos_preguntes_noves', pl: 'policia_local_preguntes_noves', act: 'actualitat_preguntes_noves' };
+    a.href = url;
+    a.download = `${noms[banc]}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+  window.exportarPreguntesCustom = exportarPreguntesCustom;
+
+  const EDITOR_CAMPS_PER_BANC = {
+    mossos: { label: 'Mossos d\'Esquadra', opcions: ['Àmbit A', 'Àmbit B', 'Àmbit C'] },
+    pl: { label: 'Policia Local', opcions: null },
+    act: { label: 'Actualitat', opcions: ['Politica', 'Esports', 'Premis', 'Altres'] }
+  };
+
+  function campsExtraEditor(banc) {
+    if (banc === 'mossos') {
+      return `
+        <label class="ed-lbl">Àmbit
+          <select id="ed-ambit">
+            <option value="Àmbit A">Àmbit A · Coneixements de l'entorn</option>
+            <option value="Àmbit B">Àmbit B · Institucional i Marc Legal</option>
+            <option value="Àmbit C">Àmbit C · Seguretat i Policia</option>
+          </select>
+        </label>
+        <label class="ed-lbl">Secció / tema <input id="ed-seccio" type="text" placeholder="p. ex. Història de Catalunya"></label>`;
+    }
+    if (banc === 'pl') {
+      const municipis = carregarMunicipisPL();
+      return `
+        <label class="ed-lbl">Tema <input id="ed-tema" type="text" placeholder="p. ex. Teoria general / Municipi"></label>
+        <label class="ed-lbl">Subtema / secció <input id="ed-seccio" type="text" placeholder="p. ex. Cunit, Cubelles..."></label>
+        <label class="ed-lbl">Municipi (opcional)
+          <select id="ed-municipi">
+            <option value="">— Cap —</option>
+            ${municipis.map(m => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('')}
+          </select>
+        </label>`;
+    }
+    return `
+      <label class="ed-lbl">Categoria
+        <select id="ed-categoria">
+          <option value="Politica">🏛️ Política</option>
+          <option value="Esports">⚽ Esports</option>
+          <option value="Premis">🏆 Premis</option>
+          <option value="Altres">📰 Altres</option>
+        </select>
+      </label>
+      <label class="ed-lbl">Subtema / secció <input id="ed-seccio" type="text" placeholder="p. ex. Actualitat setembre 2026"></label>`;
+  }
+
+  function llegirCampsExtraEditor(banc) {
+    if (banc === 'mossos') return { ambit: document.getElementById('ed-ambit')?.value, seccio: document.getElementById('ed-seccio')?.value };
+    if (banc === 'pl') return { tema: document.getElementById('ed-tema')?.value, seccio: document.getElementById('ed-seccio')?.value, municipi: document.getElementById('ed-municipi')?.value };
+    return { categoria: document.getElementById('ed-categoria')?.value, seccio: document.getElementById('ed-seccio')?.value };
+  }
+
+  function llistaPreguntesCustomHtml(banc) {
+    const dades = carregarPreguntesCustom();
+    const llista = dades[banc] || [];
+    if (!llista.length) return `<p style="color:#94a3b8;font-size:.88rem;">Encara no has afegit cap pregunta nova en aquest banc.</p>`;
+    return `<div style="display:flex;flex-direction:column;gap:8px;max-height:320px;overflow-y:auto;">
+      ${llista.map(q => `
+        <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
+          <div style="min-width:0;">
+            <div style="font-weight:700;color:#0f172a;font-size:.88rem;">${escapeHtml(q.pregunta)}</div>
+            <div style="color:#94a3b8;font-size:.74rem;margin-top:2px;">${escapeHtml(q.id)}${q.seccio ? ' · ' + escapeHtml(q.seccio) : ''}</div>
+          </div>
+          <div style="display:flex;gap:6px;flex:none;">
+            <button onclick="editarPreguntaPerId('${banc}','${q.id}')" title="Editar" style="border:none;background:#eef6ff;color:#0057a8;border-radius:8px;padding:6px 10px;font-weight:800;font-size:.76rem;cursor:pointer;">✏️</button>
+            <button onclick="eliminarPreguntaCustom('${banc}','${q.id}')" title="Eliminar" style="border:none;background:#fee2e2;color:#b91c1c;border-radius:8px;padding:6px 10px;font-weight:800;font-size:.76rem;cursor:pointer;">🗑</button>
+          </div>
+        </div>
+      `).join('')}
+    </div>`;
+  }
+
+  function mostrarGestorPreguntes(bancInicial) {
+    const contenedor = document.getElementById('view-editor');
+    if (!contenedor) return;
+    const banc = bancInicial || contenedor.dataset.bancActiu || 'mossos';
+    contenedor.dataset.bancActiu = banc;
+
+    contenedor.innerHTML = `
+      <style>
+        .ed-lbl{display:flex;flex-direction:column;gap:4px;font-weight:700;color:#334155;font-size:.85rem;}
+        .ed-lbl input,.ed-lbl select,.ed-lbl textarea{font:inherit;font-size:16px;padding:9px 11px;border:1.5px solid #E2E8F0;border-radius:9px;}
+        .ed-tabs button{border:none;background:#f1f5f9;color:#475569;padding:9px 16px;border-radius:9px;font-weight:800;cursor:pointer;font-size:.88rem;}
+        .ed-tabs button.on{background:var(--blue,#002B5E);color:#fff;}
+      </style>
+      <div style="max-width:900px;margin:0 auto;display:flex;flex-direction:column;gap:18px;">
+        <div>
+          <h2 style="margin:0 0 4px;color:#0f172a;">✏️ Gestor de preguntes</h2>
+          <p style="margin:0;color:#64748b;font-size:.9rem;line-height:1.5;">
+            Afegeix preguntes noves (una a una o en bloc) a qualsevol banc, per tema i subtema. Les preguntes es guarden al dispositiu i ja apareixen als tests immediatament. Per fer-les permanents al fitxer de dades, exporta-les i enganxa-les al .js corresponent.
+          </p>
+        </div>
+
+        <div class="ed-tabs" style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button data-banc="mossos" class="${banc === 'mossos' ? 'on' : ''}">🔵 Mossos</button>
+          <button data-banc="pl" class="${banc === 'pl' ? 'on' : ''}">🚔 Policia Local</button>
+          <button data-banc="act" class="${banc === 'act' ? 'on' : ''}">📰 Actualitat</button>
+        </div>
+
+        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:18px;">
+          <h3 style="margin:0 0 6px;font-size:1rem;color:var(--blue,#002B5E);">🔎 Cercar pregunta per ID (per corregir-la)</h3>
+          <p style="margin:0 0 10px;color:#64748b;font-size:.82rem;line-height:1.5;">
+            Si has trobat un error en una pregunta (p. ex. <code>MOSSOS_505</code>), busca-la aquí pel seu ID i corregeix-la al formulari de sota.
+          </p>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <input id="ed-cerca-id" type="text" placeholder="p. ex. MOSSOS_505" style="flex:1;min-width:180px;font-size:16px;padding:9px 11px;border:1.5px solid #E2E8F0;border-radius:9px;">
+            <button id="ed-cercar-btn" style="background:var(--blue,#002B5E);color:#fff;border:none;border-radius:9px;padding:10px 18px;font-weight:800;cursor:pointer;">🔎 Cercar</button>
+          </div>
+          <div id="ed-cerca-resultat" style="margin-top:10px;"></div>
+        </div>
+
+        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:18px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
+            <h3 style="margin:0;font-size:1rem;color:var(--blue,#002B5E);">➕ Afegir / editar pregunta</h3>
+            <span id="ed-avis-edicio" style="display:none;background:#fef9c3;color:#854d0e;font-weight:800;font-size:.78rem;padding:5px 10px;border-radius:999px;"></span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:10px;">
+            ${campsExtraEditor(banc)}
+            <label class="ed-lbl">Pregunta <textarea id="ed-pregunta" rows="2" placeholder="Text de la pregunta..."></textarea></label>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;">
+              <label class="ed-lbl">Opció A <input id="ed-op0" type="text"></label>
+              <label class="ed-lbl">Opció B <input id="ed-op1" type="text"></label>
+              <label class="ed-lbl">Opció C <input id="ed-op2" type="text"></label>
+              <label class="ed-lbl">Opció D (opcional) <input id="ed-op3" type="text"></label>
+            </div>
+            <label class="ed-lbl">Resposta correcta
+              <select id="ed-resposta">
+                <option value="0">Opció A</option>
+                <option value="1">Opció B</option>
+                <option value="2">Opció C</option>
+                <option value="3">Opció D</option>
+              </select>
+            </label>
+            <label class="ed-lbl">Explicació (opcional) <textarea id="ed-explicacio" rows="2" placeholder="Per què és correcta..."></textarea></label>
+            <div>
+              <button id="ed-guardar-una" style="background:var(--gold2,#E8C000);color:var(--blue,#002B5E);border:none;border-radius:9px;padding:11px 20px;font-weight:800;cursor:pointer;">💾 Guardar pregunta</button>
+              <button id="ed-cancelar-edicio" type="button" style="display:none;background:#f1f5f9;color:#334155;border:none;border-radius:9px;padding:11px 16px;font-weight:800;cursor:pointer;margin-left:8px;">✖ Cancel·lar edició</button>
+              <span id="ed-missatge" style="margin-left:10px;font-weight:700;font-size:.85rem;"></span>
+            </div>
+          </div>
+        </div>
+
+        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:18px;">
+          <h3 style="margin:0 0 6px;font-size:1rem;color:var(--blue,#002B5E);">📥 Afegir en massa (JSON)</h3>
+          <p style="margin:0 0 10px;color:#64748b;font-size:.82rem;line-height:1.5;">
+            Enganxa un array JSON de preguntes amb el mateix format que el banc (camps <code>pregunta</code>, <code>opcions</code>, <code>resposta</code> —índex de l'opció correcta—, <code>explicacio</code>${banc === 'mossos' ? ', <code>ambit</code>, <code>seccio</code>' : banc === 'pl' ? ', <code>tema</code>, <code>seccio</code>' : ', <code>categoria</code>, <code>seccio</code>'}).
+          </p>
+          <textarea id="ed-bulk" rows="8" style="width:100%;box-sizing:border-box;font-family:monospace;font-size:.82rem;padding:10px;border:1.5px solid #E2E8F0;border-radius:9px;" placeholder='[
+  { "pregunta": "...", "opcions": ["...","...","...","..."], "resposta": 0, "explicacio": "..." }
+]'></textarea>
+          <div style="margin-top:10px;">
+            <button id="ed-guardar-bulk" style="background:#eef6ff;color:#0057a8;border:1px solid #bfdbfe;border-radius:9px;padding:10px 18px;font-weight:800;cursor:pointer;">📥 Importar totes</button>
+            <span id="ed-missatge-bulk" style="margin-left:10px;font-weight:700;font-size:.85rem;"></span>
+          </div>
+        </div>
+
+        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:18px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;">
+            <h3 style="margin:0;font-size:1rem;color:var(--blue,#002B5E);">📋 Preguntes noves d'aquest banc</h3>
+            <button id="ed-exportar" style="background:#f1f5f9;color:#334155;border:none;border-radius:8px;padding:8px 14px;font-weight:800;font-size:.82rem;cursor:pointer;">⬇️ Exportar JSON</button>
+          </div>
+          ${llistaPreguntesCustomHtml(banc)}
+        </div>
+      </div>
+    `;
+
+    contenedor.querySelectorAll('.ed-tabs button').forEach(btn => {
+      btn.addEventListener('click', () => mostrarGestorPreguntes(btn.dataset.banc));
+    });
+
+    const msg = document.getElementById('ed-missatge');
+    document.getElementById('ed-guardar-una')?.addEventListener('click', () => {
+      try {
+        const extra = llegirCampsExtraEditor(banc);
+        const opcions = [0, 1, 2, 3].map(i => document.getElementById(`ed-op${i}`)?.value || '').filter(o => o.trim());
+        const q = {
+          ...extra,
+          pregunta: document.getElementById('ed-pregunta')?.value || '',
+          opcions,
+          resposta: parseInt(document.getElementById('ed-resposta')?.value || '0', 10),
+          explicacio: document.getElementById('ed-explicacio')?.value || ''
+        };
+        const editId = document.getElementById('ed-guardar-una')?.dataset.editId || '';
+        if (editId) {
+          desarPreguntaEditada(banc, editId, q);
+          msg.style.color = '#15803d';
+          msg.textContent = '✅ Canvis guardats.';
+        } else {
+          afegirPreguntesCustom(banc, [q]);
+          msg.style.color = '#15803d';
+          msg.textContent = '✅ Pregunta guardada.';
+        }
+        mostrarGestorPreguntes(banc);
+      } catch (e) {
+        msg.style.color = '#b91c1c';
+        msg.textContent = `❌ ${e.message}`;
+      }
+    });
+
+    document.getElementById('ed-cancelar-edicio')?.addEventListener('click', () => mostrarGestorPreguntes(banc));
+
+    // --- Cercar pregunta per ID ---
+    const cercaResultat = document.getElementById('ed-cerca-resultat');
+    function executarCercaPerId() {
+      const idBuscat = (document.getElementById('ed-cerca-id')?.value || '').trim();
+      if (!cercaResultat) return;
+      if (!idBuscat) { cercaResultat.innerHTML = ''; return; }
+      const dataset = obtenirBancActiu(banc);
+      const trobada = dataset.find(q => q && String(q.id).toLowerCase() === idBuscat.toLowerCase());
+      if (!trobada) {
+        cercaResultat.innerHTML = `<p style="color:#b91c1c;font-weight:700;font-size:.85rem;margin:6px 0 0;">❌ No s'ha trobat cap pregunta amb aquest ID en aquest banc.</p>`;
+        return;
+      }
+      const custom = carregarPreguntesCustom();
+      const esCustom = (custom[banc] || []).some(q => q.id === trobada.id);
+      const overridesBanc = carregarOverridesPreguntes()[banc] || {};
+      const teOverride = !!overridesBanc[trobada.id];
+      const etiquetaOrigen = esCustom ? '🆕 pregunta personalitzada' : (teOverride ? '✏️ pregunta original (ja editada)' : '📚 pregunta del banc original');
+      cercaResultat.innerHTML = `
+        <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:12px 14px;">
+          <div style="font-weight:700;color:#0f172a;font-size:.88rem;">${escapeHtml(trobada.pregunta)}</div>
+          <div style="color:#64748b;font-size:.76rem;margin-top:4px;">${escapeHtml(trobada.id)} · ${etiquetaOrigen}</div>
+          <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
+            <button id="ed-editar-trobada" style="background:var(--gold2,#E8C000);color:var(--blue,#002B5E);border:none;border-radius:8px;padding:8px 14px;font-weight:800;font-size:.82rem;cursor:pointer;">✏️ Editar aquesta pregunta</button>
+            ${(!esCustom && teOverride) ? `<button id="ed-restaurar-trobada" style="background:#fff;color:#b91c1c;border:1px solid #fecaca;border-radius:8px;padding:8px 14px;font-weight:800;font-size:.82rem;cursor:pointer;">↩️ Restaurar original</button>` : ''}
+          </div>
+        </div>`;
+      document.getElementById('ed-editar-trobada')?.addEventListener('click', () => carregarPreguntaAFormulari(banc, trobada));
+      document.getElementById('ed-restaurar-trobada')?.addEventListener('click', () => {
+        if (!confirm("Restaurar el text original d'aquesta pregunta? Es descartaran els canvis fets.")) return;
+        eliminarOverridePregunta(banc, trobada.id);
+        mostrarGestorPreguntes(banc);
+      });
+    }
+    document.getElementById('ed-cercar-btn')?.addEventListener('click', executarCercaPerId);
+    document.getElementById('ed-cerca-id')?.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); executarCercaPerId(); }
+    });
+
+    const msgBulk = document.getElementById('ed-missatge-bulk');
+    document.getElementById('ed-guardar-bulk')?.addEventListener('click', () => {
+      try {
+        const text = document.getElementById('ed-bulk')?.value || '[]';
+        const arr = JSON.parse(text);
+        if (!Array.isArray(arr)) throw new Error('Cal enganxar un array JSON ([ {...}, {...} ]).');
+        const n = afegirPreguntesCustom(banc, arr);
+        msgBulk.style.color = '#15803d';
+        msgBulk.textContent = `✅ ${n} preguntes importades.`;
+        mostrarGestorPreguntes(banc);
+      } catch (e) {
+        msgBulk.style.color = '#b91c1c';
+        msgBulk.textContent = `❌ ${e.message}`;
+      }
+    });
+
+    document.getElementById('ed-exportar')?.addEventListener('click', () => exportarPreguntesCustom(banc));
+  }
+  window.mostrarGestorPreguntes = mostrarGestorPreguntes;
 
   // --- SELECTOR DE PREGUNTAS ---
   function mostrarSelectorPreguntas(nom, dataset, mezclar = false) {
@@ -1431,8 +2096,12 @@ document.addEventListener('DOMContentLoaded', () => {
         ? 'Actualitat'
         : 'Mossos';
     dataset = (dataset || []).map(q => ({ ...q, _font: q._font || fontSelector }));
-    const activeView = document.getElementById('test-container') || document.querySelector('.view-content') || document.body;
+    const activeView = obtenirContenidorTest() || document.querySelector('.view-content') || document.body;
     if (!activeView) return;
+
+    // Amaguem el "Tria un tema" i els botons d'àmbit perquè no quedin visibles
+    // per sobre del selector/test que estem a punt de mostrar.
+    document.querySelectorAll('.hub').forEach(h => { h.style.display = 'none'; });
 
     activeView.innerHTML = `
       <div style="background: #ffffff; padding: 28px; border-radius: 16px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); text-align: center; margin-top: 20px;">
@@ -1479,8 +2148,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // --- SELECTOR DE SECCIONS DINS D'UN ÀMBIT ---
   function mostrarSelectorSeccions(nomAmbit, dataset, onTornar) {
-    const activeView = document.getElementById('test-container') || document.querySelector('.view-content') || document.body;
+    const activeView = obtenirContenidorTest() || document.querySelector('.view-content') || document.body;
     if (!activeView) return;
+
+    // Amaguem el "Tria un tema" i els botons d'àmbit mentre es tria la secció/test.
+    document.querySelectorAll('.hub').forEach(h => { h.style.display = 'none'; });
 
     // Agrupem les preguntes per secció, mantenint l'ordre d'aparició al banc
     const seccionsMap = new Map();
@@ -1678,9 +2350,13 @@ function iniciarExamenOficial(mode = 'estudi') {
     function acabarExamen(perTemps = false) {
       if (temporitzador) { clearInterval(temporitzador); temporitzador = null; }
       if (window._agentMedinaTimer) { clearInterval(window._agentMedinaTimer); window._agentMedinaTimer = null; }
-      // La pregunta actual compta com a blanca si el temps s'acaba sense resposta.
-      if (index < examen.length && !respostaDonada) blancs++;
       index = examen.length;
+
+      // Recalculem els blancs a partir del total, tant si s'acaba pel temps, per haver
+      // respost totes les preguntes, com si l'usuari decideix finalitzar l'examen a mitges
+      // (botó "Finalitzar ara"). Així sempre queden correctament comptades totes les
+      // preguntes que s'han quedat sense contestar.
+      blancs = Math.max(0, examen.length - encerts - errors);
 
       const c = contenidor();
       if (!c) return;
@@ -1739,10 +2415,17 @@ function iniciarExamenOficial(mode = 'estudi') {
             <span id="rellotge-examen-oficial" style="font-size:18px;font-weight:800;">⏱️ 30:00</span>
           </div>
           <div style="height:7px;background:#e2e8f0;border-radius:99px;overflow:hidden;margin-bottom:20px;"><div style="width:${((index)/30)*100}%;height:100%;background:#007aff;"></div></div>
+          <div style="display:flex;justify-content:flex-end;margin-bottom:6px;">${etiquetaIdPreguntaHtml(q)}</div>
           <h3 style="margin:0;color:#0f172a;font-size:17px;line-height:1.45;">${q.pregunta}</h3>
           <div id="llista-opcions-oficial" style="display:flex;flex-direction:column;gap:10px;margin-top:18px;"></div>
           <div id="feedback-oficial" style="margin-top:15px;"></div>
+          <button id="btn-finalitzar-ara-oficial" style="margin-top:18px;width:100%;background:#fff;color:#b91c1c;border:1.5px solid #fecaca;padding:11px 18px;border-radius:8px;font-weight:700;cursor:pointer;">🏁 Finalitzar ara (${encerts + errors} de 30 contestades)</button>
         </div>`;
+      c.querySelector('#btn-finalitzar-ara-oficial').onclick = () => {
+        if (confirm('Segur que vols finalitzar l\'examen ara? Les preguntes que et quedin sense contestar comptaran com a blanc.')) {
+          acabarExamen(false);
+        }
+      };
       const lista = c.querySelector('#llista-opcions-oficial');
       opcions.forEach((opcio, i) => {
         const b = document.createElement('button');
@@ -1900,7 +2583,10 @@ function mostrarPreguntaAmbSeguent(preguntaObj, indexActual, totalPreguntes, onS
 
     contenedor.innerHTML = `
         <div class="pregunta-box" style="background: white; padding: 25px; border-radius: 16px; border: 1px solid #e2e8f0; margin-top: 15px; max-height: 75vh; overflow-y: auto; box-sizing: border-box;">
-            <div style="font-size: 12px; color: #64748b; font-weight: 700; margin-bottom: 8px;">Pregunta ${indexActual + 1} de ${totalPreguntes}</div>
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px;">
+                <div style="font-size: 12px; color: #64748b; font-weight: 700;">Pregunta ${indexActual + 1} de ${totalPreguntes}</div>
+                ${etiquetaIdPreguntaHtml(preguntaObj)}
+            </div>
             <h3 style="margin-top: 0; color: #0f172a; font-size: 16px;">${preguntaObj.pregunta}</h3>
             <div style="display: flex; flex-direction: column; gap: 10px; margin-top: 15px;" id="llista-opcions"></div>
         </div>
@@ -1922,8 +2608,9 @@ function mostrarPreguntaAmbSeguent(preguntaObj, indexActual, totalPreguntes, onS
             const esCorrecte = (index === nouIndexCorrecte);
             
             if (preguntaObj.id) {
+                const fontPregunta = (typeof detectarFontPregunta === 'function' ? detectarFontPregunta(preguntaObj) : '') || 'Mossos';
                 registrarRespuestaGlobal(preguntaObj.id, esCorrecte, preguntaObj);
-                if (esCorrecte) eliminarPreguntaAcertada(preguntaObj.id);
+                if (esCorrecte) eliminarPreguntaAcertada(preguntaObj.id, fontPregunta);
                 else guardarPreguntaFallada(preguntaObj);
             }
 
@@ -2004,3 +2691,198 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 });
     });
+
+// ==========================================
+// 5. EXPORTAR / IMPORTAR PROGRÉS (portabilitat entre dispositius)
+// ==========================================
+// Es guarda TOT el que hi ha a localStorage (estadístiques, errors, ratxa,
+// convocatòries, notes...) en un únic fitxer JSON. Així es pot descarregar
+// des de l'ordinador i importar-lo al mòbil (o a l'inrevés) sense servidor.
+
+function exportarProgresJSON() {
+  try {
+    const dades = {};
+    for (let i = 0; i < localStorage.length; i++) {
+      const clau = localStorage.key(i);
+      dades[clau] = localStorage.getItem(clau);
+    }
+
+    const payload = {
+      app: 'agent-medina',
+      versio: 1,
+      exportatEl: new Date().toISOString(),
+      dades
+    };
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const enllac = document.createElement('a');
+    const dataFitxer = new Date().toISOString().slice(0, 10);
+    enllac.href = url;
+    enllac.download = `agent-medina-progres-${dataFitxer}.json`;
+    document.body.appendChild(enllac);
+    enllac.click();
+    enllac.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 3000);
+
+    const btn = document.getElementById('btn-exportar-progres');
+    if (btn) {
+      const original = btn.textContent;
+      btn.textContent = '✅ Fitxer descarregat!';
+      setTimeout(() => { btn.textContent = original; }, 2200);
+    }
+    return true;
+  } catch (e) {
+    alert('❌ No s\'ha pogut exportar el progrés: ' + e.message);
+    return false;
+  }
+}
+window.exportarProgresJSON = exportarProgresJSON;
+
+function importarProgresJSON(fitxer) {
+  if (!fitxer) return;
+  const lector = new FileReader();
+
+  lector.onload = (ev) => {
+    try {
+      const payload = JSON.parse(ev.target.result);
+      // Tolerant tant al format nou {app, dades:{...}} com a un bolcat "en cru" de localStorage.
+      const dades = (payload && typeof payload === 'object' && payload.dades) ? payload.dades : payload;
+
+      if (!dades || typeof dades !== 'object' || Array.isArray(dades)) {
+        throw new Error('El fitxer no té el format esperat d\'una còpia de seguretat d\'Agent Medina.');
+      }
+
+      const numClaus = Object.keys(dades).length;
+      if (!numClaus) throw new Error('El fitxer no conté cap dada per importar.');
+
+      const missatge = `Vols importar aquesta còpia de seguretat?\n\n` +
+        `Es sobreescriurà el progrés d'aquest dispositiu (errors, ratxa, estadístiques, convocatòries...) ` +
+        `amb el contingut del fitxer (${numClaus} claus).\n\nAquesta acció no es pot desfer.`;
+      if (!confirm(missatge)) return;
+
+      Object.keys(dades).forEach(clau => {
+        try {
+          const valor = dades[clau];
+          localStorage.setItem(clau, typeof valor === 'string' ? valor : JSON.stringify(valor));
+        } catch (e) { /* clau individual corrupta: la ignorem i seguim amb la resta */ }
+      });
+
+      alert('✅ Progrés importat correctament. Es recarregarà la pàgina per aplicar els canvis.');
+      window.location.reload();
+    } catch (e) {
+      alert('❌ El fitxer seleccionat no és una còpia de seguretat vàlida d\'Agent Medina.\n\n' + e.message);
+    }
+  };
+
+  lector.onerror = () => alert('❌ No s\'ha pogut llegir el fitxer seleccionat.');
+  lector.readAsText(fitxer);
+}
+window.importarProgresJSON = importarProgresJSON;
+
+function gestionarSeleccioFitxerImport(input) {
+  const fitxer = input?.files?.[0];
+  if (fitxer) importarProgresJSON(fitxer);
+  if (input) input.value = '';
+}
+window.gestionarSeleccioFitxerImport = gestionarSeleccioFitxerImport;
+
+// ==========================================
+// 6. DRECERES DE TECLAT (ordinador): 1-4 / A-D per respondre, Enter per continuar
+// ==========================================
+(function configurarDreceresTeclat() {
+  const IDS_CONTENIDOR_OPCIONS = ['llista-opcions', 'rep-errors-options'];
+  const IDS_BOTO_SEGUENT = [
+    'btn-seguent-pregunta',
+    'btn-seguent-repas-test',
+    'rep-errors-next',
+    'btn-tornar-inici-repas-test',
+    'rep-errors-home'
+  ];
+
+  function esVisible(el) {
+    return !!el && el.offsetParent !== null;
+  }
+
+  function trobarContenidorOpcions() {
+    for (const id of IDS_CONTENIDOR_OPCIONS) {
+      const el = document.getElementById(id);
+      if (esVisible(el)) return el;
+    }
+    return null;
+  }
+
+  function trobarBotoSeguent() {
+    for (const id of IDS_BOTO_SEGUENT) {
+      const el = document.getElementById(id);
+      if (esVisible(el) && !el.disabled) return el;
+    }
+    return null;
+  }
+
+  document.addEventListener('keydown', (e) => {
+    const actiu = document.activeElement;
+    const tag = (actiu && actiu.tagName || '').toLowerCase();
+    // No interferim si l'usuari està escrivint en un camp de text/cerca.
+    if (tag === 'input' || tag === 'textarea' || actiu?.isContentEditable) return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+    const mapaLletres = { a: 0, b: 1, c: 2, d: 3 };
+    let idx = null;
+    if (e.key >= '1' && e.key <= '4') idx = Number(e.key) - 1;
+    else if (Object.prototype.hasOwnProperty.call(mapaLletres, e.key.toLowerCase())) idx = mapaLletres[e.key.toLowerCase()];
+
+    if (idx !== null) {
+      const contenidor = trobarContenidorOpcions();
+      if (contenidor) {
+        const botons = Array.from(contenidor.querySelectorAll('button')).filter(b => !b.disabled && b.style.pointerEvents !== 'none');
+        if (botons[idx]) {
+          e.preventDefault();
+          botons[idx].click();
+        }
+      }
+      return;
+    }
+
+    if (e.key === 'Enter') {
+      const boto = trobarBotoSeguent();
+      if (boto) {
+        e.preventDefault();
+        boto.click();
+      }
+    }
+  });
+})();
+
+// ==========================================
+// 7. PWA: registre del Service Worker + botó d'instal·lació
+// ==========================================
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').catch(() => { /* PWA opcional: si falla, l'app segueix funcionant normal */ });
+  });
+}
+
+let deferredInstallPrompt = null;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  deferredInstallPrompt = e;
+  window.deferredInstallPromptDisponible = true;
+  const btn = document.getElementById('btn-instalar-app');
+  if (btn) btn.style.display = 'inline-flex';
+});
+
+function instalarAppPWA() {
+  if (!deferredInstallPrompt) {
+    alert('La instal·lació ja està feta o el teu navegador no la permet des d\'aquí. Al mòbil Android, prova el menú del navegador → "Afegir a la pantalla d\'inici".');
+    return;
+  }
+  deferredInstallPrompt.prompt();
+  deferredInstallPrompt.userChoice.finally(() => {
+    deferredInstallPrompt = null;
+    window.deferredInstallPromptDisponible = false;
+    const btn = document.getElementById('btn-instalar-app');
+    if (btn) btn.style.display = 'none';
+  });
+}
+window.instalarAppPWA = instalarAppPWA;

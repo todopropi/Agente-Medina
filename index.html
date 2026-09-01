@@ -12,6 +12,14 @@
   <link rel="apple-touch-icon" href="icon-180.png?v=1">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&amp;display=swap" rel="stylesheet">
 
+  <!-- PWA: instal·lable a Android/iOS/escriptori -->
+  <link rel="manifest" href="manifest.webmanifest">
+  <meta name="theme-color" content="#002B5E">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Agent Medina">
+
   <!-- Arxius CSS locals -->
   <link rel="stylesheet" href="index-BNhYZkE9.css">
   <link rel="stylesheet" href="Dashboard-BJqoIV_6.css">
@@ -111,13 +119,27 @@
     overflow-y: scroll !important;
   }
 
-  /* Desbloquejar qualsevol contenidor general que retingui la pantalla fixa a l'ordinador */
-  body > div, .app-container, .main-layout, .dashboard, .view-content, #test-container, .teoria-host {
+  /* Desbloquejar qualsevol contenidor general que retingui la pantalla fixa a l'ordinador.
+     IMPORTANT: fem servir #root en lloc de "body > div" perquè aquest darrer selector
+     també "capturava" finestres emergents (com el modal de Convocatòries) que s'afegeixen
+     directament al <body> amb position:fixed, convertint-les en blocs normals que
+     apareixien al final de la pàgina en lloc de com a finestra emergent centrada. */
+  #root, .app-container, .main-layout, .dashboard, .view-content, #test-container, .teoria-host {
     height: auto !important;
     min-height: auto !important;
     max-height: none !important;
     overflow: visible !important;
     position: static !important;
+  }
+
+  /* Qualsevol finestra emergent (modal) afegida dinàmicament al body ha de continuar
+     funcionant com a overlay fix a pantalla completa, tant a mòbil com a ordinador. */
+  body > div[id^="modal-"] {
+    position: fixed !important;
+    inset: 0 !important;
+    height: auto !important;
+    max-height: none !important;
+    overflow: auto !important;
   }
 
   /* El .layout i el .content.fit porten "overflow:hidden" i alçada fixa (100dvh)
@@ -176,6 +198,7 @@
           <a data-tab="mossos" class="nav-btn"><span class="ico"><img src="escut.png" alt="Escut" style="width: 20px; height: 20px; vertical-align: middle;"></span> Temari Mossos</a>
           <a data-tab="policia-local" class="nav-btn"><span class="ico">🚔</span> Policia Local</a>
           <a data-tab="actualitat" class="nav-btn"><span class="ico">📰</span> Actualitat</a>
+          <a data-tab="editor" class="nav-btn"><span class="ico">✏️</span> Gestor de preguntes</a>
           <a data-tab="comunitat" class="nav-btn nav-comunitat"><span class="ico">💬</span> Comunitat</a>
         </nav>
       </aside>
@@ -248,6 +271,11 @@
                   Començar Ara 🚀
                 </button>
               </div>
+              <!-- NOTA: aquesta vista #view-inici es reconstrueix per complet en carregar
+                   la pàgina mitjançant la funció mostrarInici() d'app.js (dashboard real,
+                   botons d'accés ràpid, exportar/importar progrés, etc.). El contingut
+                   estàtic d'aquí sota només es veu una fracció de segon abans que el JS
+                   pinti la versió definitiva. -->
 
               <!-- 3. FLASHCARDS -->
               <div style="background: white; border: 1px solid #e9ecef; padding: 20px; border-radius: 12px;">
@@ -379,6 +407,11 @@
             <h2>Comunitat</h2>
             <p>Fòrum i xat de la comunitat.</p>
           </div>
+
+          <div id="view-editor" class="view-content" style="display: none;">
+            <h2>Gestor de preguntes</h2>
+            <p>Afegeix o edita preguntes.</p>
+          </div>
         </div>
 
         <nav class="bottom-nav">
@@ -386,6 +419,7 @@
           <button data-tab="mossos" class="bn-item"><span class="bn-ico"><img src="escut.png" alt="Escut" style="width: 20px; height: 20px; vertical-align: middle;"></span><span class="bn-lab">Mossos</span></button>
           <button data-tab="policia-local" class="bn-item"><span class="bn-ico">🚔</span><span class="bn-lab">P. Local</span></button>
           <button data-tab="actualitat" class="bn-item"><span class="bn-ico">📰</span><span class="bn-lab">Actualitat</span></button>
+          <button data-tab="editor" class="bn-item"><span class="bn-ico">✏️</span><span class="bn-lab">Preguntes</span></button>
         </nav>
       </div>
     </div>
@@ -674,9 +708,9 @@
 
 
 </script>
-<script src="preguntas.js"></script>
-<script src="preguntas_pl.js"></script>
-<script src="preguntas_act.js"></script>
+<script src="Mossos_Preguntas.js"></script>
+<script src="P_L_Preguntas.js"></script>
+<script src="Actualidad_preguntas.js"></script>
 <script src="app.js"></script>
 
 </body>
